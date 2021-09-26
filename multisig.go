@@ -2,48 +2,31 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/btcsuite/btcd/btcjson"
-
-	//"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcutil"
+	"github.com/fatih/color"
 	"io"
 	"os"
 	"runtime/debug"
-
-	"github.com/btcsuite/btcd/rpcclient"
-	//"github.com/ethereum/go-ethereum/rpc"
-	"github.com/fatih/color"
 )
 
 var (
 	configFile = "config.json"
+	address = "2MsoE4GPg2Gn2LwGXUhupaRuLcBvwj6NvyW"
 )
 
-type config struct {
+type rpcConfig struct {
 	User string `json:"user"`
 	Pass string `json:"pass"`
 }
 
-//type Address interface {
-//	String() string
-//	EncodeAddress() string
-//	ScriptAddress() []byte
-//	IsForNet(*chaincfg.Params) bool
-//}
-
-type dogeAddress struct {
-	addr string
-}
-
-
-
 func main() {
-	fmt.Println("Started")
-
 	cfg, err := loadCfg()
 	if err != nil {
-		printErrMsg(err)
+		printErr(err)
 		return
 	}
 
@@ -51,59 +34,152 @@ func main() {
 	client, err := rpcclient.New(&rpcclient.ConnConfig{
 		HTTPPostMode: true,
 		DisableTLS:   true,
-		Host:         "127.0.0.1:44555",
+		Host:         "localhost:44555",
 		User:         cfg.User,
 		Pass:         cfg.Pass,
 	}, nil)
 	if err != nil {
-		printErrMsg(err)
+		printErr(err)
 		return
 	}
 
-	// Everything else!
-	//r, err := client.ListUnspent()
+	addressFrom, err := btcutil.DecodeAddress(address, &DogeTestNetParams)
 
-	addr, err := btcutil.DecodeAddress("2MsoE4GPg2Gn2LwGXUhupaRuLcBvwj6NvyW", &DogeTestNetParams)
-
-	r, err := client.ListUnspentMinMaxAddresses(0, 999999999, []btcutil.Address{addr})
+	r, err := client.ListUnspentMinMaxAddresses(0, 999999999, []btcutil.Address{addressFrom})
 
 	if err != nil {
-		printErrMsg(err)
+		printErr(err)
 		return
 	}
-	var target int64 = 5 * 1e8
-	fmt.Println(gatherInputs(target, r), "doge")
+	target, err := readAmount()
+	if err != nil {
+		printErr(err)
+		return
+	}
+	unspentOutputs, err := gatherInputs(target, r)
+	if err != nil {
+		printErr(err)
+		return
+	}
+	fmt.Println(toJSON(unspentOutputs))
 
+	inputs := make([]btcjson.TransactionInput, len(unspentOutputs))
+	for i, v := range unspentOutputs {
+		inputs[i] = btcjson.TransactionInput{
+			Txid: v.TxID,
+			Vout: v.Vout,
+		}
+	}
+
+	outputs := make(map[btcutil.Address]btcutil.Amount)
+	addr, err := readAddress()
+	if err != nil {
+		printErr(err)
+		return
+	}
+	outputs[addr] = target
+
+	locktime := int64(0)
+
+	//fmt.Println(len(outputs))
+	//fmt.Println(toJSON(inputs), outputs)
+	transaction, err := client.CreatePSBTTransaction(inputs, outputs, &(locktime))
+	if err != nil {
+		printErr(err)
+		return
+	}
+	fmt.Println(transaction)
+
+	//base64decoded, err := base64.StdEncoding.DecodeString(transaction)
+	//if err != nil {
+	//	printErr(err)
+	//	return
+	//}
+	s, err := client.DecodePSBT(transaction)
+	if err != nil {
+		printErr(err)
+		return
+	}
+	fmt.Println(s)
 	//client.CreateRawTransaction()
-	
+
 	// get transaction outputs
 	// accumulate them into one big input slightly larger than the amount we want to send
 	// create partially signed bitcoin transaction so that the other parties in the multisig address can sign too
 	// broadcast finalized transaction
 }
 
-func gatherInputs(target int64, r []btcjson.ListUnspentResult) []btcjson.ListUnspentResult {
-	result := make([]btcjson.ListUnspentResult, 0, 10)
-	var current int64 = 0
-	for i := range r {
-		current += int64(r[i].Amount*1e8)
-		result = append(result, r[i])
-		//fmt.Println("It worked:", r[i].TxID, r[i].Vout, "acumulated:", current)
-		if current > target {
+func readAmount() (btcutil.Amount, error) {
+	amt := 0.0
+	fmt.Print("Enter amount to send: ")
+	color.Set(color.FgHiCyan)
+	_, err := fmt.Scanf("%f", &amt)
+	color.Unset()
+	if err != nil {
+		return 0, err
+	}
+	amount, err := btcutil.NewAmount(amt)
+	if err != nil {
+		return 0, err
+	}
+
+	return amount, nil
+}
+
+
+func readAddress() (btcutil.Address, error) {
+	addr := ""
+	var decodeAddress btcutil.Address
+	var err error
+	for true {
+		color.Set(color.FgHiCyan)
+		fmt.Print("Enter address to send to: ")
+		_, err = fmt.Scanf("%s", &addr)
+		if err != nil {
+			return nil, err
+		}
+		color.Unset()
+		if addr == "" {
+			return nil, errors.New("user doesn't wanna do a transaction :(((")
+		}
+		decodeAddress, err = btcutil.DecodeAddress(addr, &DogeTestNetParams)
+		if err == nil {
 			break
 		}
 	}
-	return result
+
+	return decodeAddress, nil
 }
 
-func printErrMsg(err error) {
-	fmt.Println(color.RedString("error: "), err)
+func gatherInputs(target btcutil.Amount, r []btcjson.ListUnspentResult) ([]btcjson.ListUnspentResult, error) {
+	if target < 1 {
+		return nil, errors.New("silly human, one can't send that much money")
+	}
+	result := make([]btcjson.ListUnspentResult, 0, 10)
+	// TODO: sort to pick as many small unspent outputs as possible?
+	var current float64 = 0
+	for i := range r {
+		current += r[i].Amount
+		result = append(result, r[i])
+		//fmt.Println("It worked:", r[i].TxID, r[i].Vout, "acumulated:", current)
+		if current > target.ToBTC() {
+			break
+		}
+	}
+	if current <= target.ToBTC() {
+		return nil, errors.New("not enough funds")
+	}
+	return result, nil
+}
+
+func printErr(err error) {
+	fmt.Println(color.RedString("error:"), err)
 	debug.PrintStack()
 }
 
-func loadCfg() (*config, error) {
+func loadCfg() (*rpcConfig, error) {
 	// Load config to get username & password
-	cfg := new(config)
+	cfg := new(rpcConfig)
 	f, err := os.Open(configFile)
 	if err != nil {
 		return nil, err
@@ -117,4 +193,10 @@ func loadCfg() (*config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func toJSON(v interface{}) string {
+	//s, _ := json.Marshal(v)
+	s, _ := json.MarshalIndent(v, "", "   ")
+	return string(s)
 }
